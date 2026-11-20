@@ -43,6 +43,20 @@ interface CursorResultEvent {
     type: "result";
     subtype: string;
     duration_ms: number;
+    usage?: {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadTokens?: number;
+        cacheWriteTokens?: number;
+    };
+}
+
+/** Tokens from one Cursor CLI process. `input` is uncached prompt tokens (cache misses). */
+export interface CursorTurnUsage {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
 }
 
 interface CursorEventBase {
@@ -77,6 +91,52 @@ export interface CursorNativeLiveRun {
     errorMessage?: string;
     child?: ReturnType<typeof spawn>;
     toolCounter: number;
+    /** Rolling tail of assistant text, used to catch a split "Auto routed to" line. */
+    routedScan?: string;
+    /** Display name of the model Cursor Auto last selected in this process. */
+    routedModel?: string;
+    /** Real token usage from the CLI result event. Absent when the CLI did not report it. */
+    usage?: CursorTurnUsage;
+    statsQueued?: boolean;
+}
+
+/** Last "Auto routed to …" name in assistant text, if Cursor announced one. */
+export function latestRoutedModel(text: string): string | undefined {
+    const routed = /(?:^|\n)>\s*Auto routed to\s+([^\n]+)/gi;
+    let last: string | undefined;
+    for (const match of text.matchAll(routed)) {
+        const name = match[1]?.trim();
+        if (name && name.toLowerCase() !== "auto") last = name;
+    }
+    return last;
+}
+
+export function noteCursorRoutedModel(run: CursorNativeLiveRun, text: string): void {
+    if (!text) return;
+    run.routedScan = `${run.routedScan ?? ""}${text}`.slice(-800);
+    const routed = latestRoutedModel(run.routedScan);
+    if (routed) run.routedModel = routed;
+}
+
+function finiteToken(value: unknown): number {
+    const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Read cache hits (`cacheRead`) and misses (`input`) from a Cursor stream-json result. */
+export function readCursorResultUsage(event: { usage?: CursorResultEvent["usage"] }): CursorTurnUsage | undefined {
+    const usage = event.usage;
+    if (!usage) return undefined;
+    const present = [usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].some(
+        (value) => value !== undefined && value !== null,
+    );
+    if (!present) return undefined;
+    return {
+        input: finiteToken(usage.inputTokens),
+        output: finiteToken(usage.outputTokens),
+        cacheRead: finiteToken(usage.cacheReadTokens),
+        cacheWrite: finiteToken(usage.cacheWriteTokens),
+    };
 }
 
 interface StartCursorNativeRunOptions {
@@ -84,6 +144,8 @@ interface StartCursorNativeRunOptions {
     args: string[];
     signal?: AbortSignal;
     onSessionId: (cursorSessionId: string) => void;
+    /** Called once stdout has closed and the process has exited, before the run is marked done. */
+    onSettled?: (run: CursorNativeLiveRun) => void;
 }
 
 let cursorNativeReplayCounter = 0;
@@ -261,10 +323,18 @@ export function startCursorNativeRun(options: StartCursorNativeRunOptions): Curs
         if (event.type === "assistant") {
             const ae = event as CursorAssistantEvent;
             for (const block of ae.message.content) {
-                if (block.type === "text" && block.text.trim()) {
+                if (block.type !== "text" || !block.text) continue;
+                noteCursorRoutedModel(run, block.text);
+                if (block.text.trim()) {
                     queueCursorNativeEvent(run, { type: "text-delta", text: block.text });
                 }
             }
+            return;
+        }
+
+        if (event.type === "result") {
+            const usage = readCursorResultUsage(event as CursorResultEvent);
+            if (usage) run.usage = usage;
             return;
         }
 
@@ -322,25 +392,42 @@ export function startCursorNativeRun(options: StartCursorNativeRunOptions): Curs
         }
     });
 
-    child.on("close", (code) => {
+    // The result line is the last thing the CLI writes. Wait for readline to finish
+    // that line before marking the run done, or the usage never lands on the run.
+    let childExitCode: number | null | undefined;
+    let stdoutClosed = false;
+    const finishRun = () => {
+        if (childExitCode === undefined || !stdoutClosed || run.done) return;
         options.signal?.removeEventListener("abort", onAbort);
+        options.onSettled?.(run);
         run.done = true;
         if (options.signal?.aborted) {
             run.errorMessage = "aborted";
             queueCursorNativeEvent(run, { type: "error", message: "aborted" });
             return;
         }
-        if (code !== 0) {
+        if (childExitCode !== 0) {
             const stderr = stderrChunks.join("").trim();
-            run.errorMessage = stderr || `Cursor CLI exited with code ${code}`;
+            run.errorMessage = stderr || `Cursor CLI exited with code ${childExitCode}`;
             queueCursorNativeEvent(run, { type: "error", message: run.errorMessage });
             return;
         }
         queueCursorNativeEvent(run, { type: "done" });
+    };
+
+    child.on("close", (code) => {
+        childExitCode = code;
+        finishRun();
+    });
+
+    rl.on("close", () => {
+        stdoutClosed = true;
+        finishRun();
     });
 
     child.on("error", (err) => {
         options.signal?.removeEventListener("abort", onAbort);
+        if (!run.done) options.onSettled?.(run);
         run.done = true;
         run.errorMessage = err.message;
         queueCursorNativeEvent(run, { type: "error", message: err.message });

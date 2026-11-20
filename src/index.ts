@@ -40,6 +40,14 @@ import {
     takeCursorNativeQueuedEvent,
     waitForCursorNativeRunProgress,
 } from "./cursor-process.js";
+import {
+    CURSOR_TURN_STATS_TYPE,
+    autoRoutedModel,
+    collectCacheStatus,
+    formatCacheStatus,
+    statsFromUsage,
+    type CursorTurnStats,
+} from "./status-line.js";
 import { runAgentModels, STATIC_MODELS, toCursorId, toProviderModels } from "./models.js";
 import {
     type CursorNativeToolDisplayItem,
@@ -271,7 +279,10 @@ function syncCursorSessionState(ctx: ExtensionContext, state: CursorSessionState
 // streamSimple — the custom backend for the cursor provider
 // ---------------------------------------------------------------------------
 
-function createStreamCursorCli(cursorSessionState: CursorSessionState) {
+function createStreamCursorCli(
+    cursorSessionState: CursorSessionState,
+    onRunSettled: (run: CursorNativeLiveRun) => void,
+) {
     return function streamCursorCli(
         model: Model<Api>,
         context: Context,
@@ -567,6 +578,7 @@ function createStreamCursorCli(cursorSessionState: CursorSessionState) {
                     agentPath,
                     args,
                     signal: options?.signal,
+                    onSettled: onRunSettled,
                     onSessionId: (cursorSessionId) => {
                         cursorSessionState.current = cursorSessionId;
                         if (cursorSessionState.persisted !== cursorSessionId) {
@@ -624,12 +636,73 @@ export default async function (pi: ExtensionAPI) {
         syncCursorSessionState(ctx, cursorSessionState);
     });
 
-    pi.on("agent_end", async () => {
-        if (cursorSessionState.pending === undefined) return;
+    const pendingTurnStats: CursorTurnStats[] = [];
 
+    const rememberTurnStats = (run: CursorNativeLiveRun) => {
+        if (run.statsQueued) return;
+        const stats = statsFromUsage(run.usage, run.routedModel);
+        if (!stats) return;
+        run.statsQueued = true;
+        pendingTurnStats.push(stats);
+    };
+
+    const flushTurnStats = (piApi: ExtensionAPI) => {
+        while (pendingTurnStats.length > 0) {
+            const stats = pendingTurnStats.shift();
+            if (stats) piApi.appendEntry(CURSOR_TURN_STATS_TYPE, stats);
+        }
+    };
+
+    const publishStatus = (ctx: ExtensionContext, extraText = "") => {
+        const stats = collectCacheStatus(ctx.sessionManager.getBranch(), extraText);
+        const footer = globalThis as { __piCursorFooterRight?: string; __piCursorRoutedModel?: string };
+        footer.__piCursorFooterRight = formatCacheStatus(stats);
+        // Appended to the model id, so the agent label reads `auto → Grok 4.7`.
+        footer.__piCursorRoutedModel = autoRoutedModel(stats, ctx.model?.id);
+        // The built-in footer reads both onto the right of the stats line.
+        // A setStatus row would add a second line.
+        ctx.ui.setStatus("cache", undefined);
+    };
+
+    const assistantText = (message: { role?: string; content?: unknown } | undefined): string => {
+        if (!message || message.role !== "assistant") return "";
+        const content = message.content;
+        if (typeof content === "string") return content;
+        if (!Array.isArray(content)) return "";
+        return content
+            .filter((block): block is { type: string; text?: string } => !!block && typeof block === "object")
+            .filter((block) => block.type === "text" && typeof block.text === "string")
+            .map((block) => block.text ?? "")
+            .join("\n");
+    };
+
+    pi.on("session_start", async (_event, ctx) => {
+        publishStatus(ctx);
+    });
+
+    pi.on("session_tree", async (_event, ctx) => {
+        publishStatus(ctx);
+    });
+
+    pi.on("model_select", async (_event, ctx) => {
+        publishStatus(ctx);
+    });
+
+    pi.on("message_update", async (event, ctx) => {
+        publishStatus(ctx, assistantText(event.message));
+    });
+
+    pi.on("turn_end", async (_event, ctx) => {
+        flushTurnStats(pi);
+        publishStatus(ctx);
+    });
+
+    pi.on("agent_end", async (_event, ctx) => {
         const pending = cursorSessionState.pending;
         cursorSessionState.pending = undefined;
-        persistCursorSessionId(pi, cursorSessionState, pending ?? undefined);
+        if (pending !== undefined) persistCursorSessionId(pi, cursorSessionState, pending ?? undefined);
+        flushTurnStats(pi);
+        publishStatus(ctx);
     });
 
     let modelDefs = STATIC_MODELS;
@@ -650,6 +723,6 @@ export default async function (pi: ExtensionAPI) {
         oauth: createCursorCliOAuthCompatibility(),
         api: "cursor-cli" as Api,
         models: toProviderModels(modelDefs),
-        streamSimple: createStreamCursorCli(cursorSessionState),
+        streamSimple: createStreamCursorCli(cursorSessionState, rememberTurnStats),
     });
 }
